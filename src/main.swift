@@ -12,6 +12,7 @@ typealias DisplaySig = String
 
 typealias SpaceId = WinNum // see NSWindow.windowNumber (Int)
 
+@available(macOS 10.12, *)
 class AppDelegate: NSObject, NSApplicationDelegate {
 	private var statusItem: NSStatusItem!
 	private var numScreens: Int = NSScreen.screens.count
@@ -24,13 +25,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 	// Debounced restore
 	private var restoreDebounce: DispatchWorkItem?
 	private let restoreDelay: TimeInterval = 1.6
+	// Screen-change sequencing and settle handling
+	private var screenChangeSeq: Int = 0
+	private var lastScreenChangeAt: Date = Date.distantPast
+	private let settleRestoreDelays: [TimeInterval] = [1.6, 8.0, 20.0, 40.0, 70.0]
+	private let settleDeferredSaveDelay: TimeInterval = 75.0
 
+	// Display settle / wallpaper readiness probing (for diagnosing how long externals take to fully come back)
+	private var externalsDetectedAt: Date? = nil
+	private var wallpaperProbeSeq: Int = 0
+	private var lastWallpaperWindowCount: Int = -1
+	private let wallpaperProbeInterval: TimeInterval = 2.0
+	private let wallpaperProbeTimeout: TimeInterval = 120.0
 	// Last stable snapshot (captured periodically) to prevent overwriting good layouts on unplug.
 	private var lastStableSig: DisplaySig = ""
 	private var lastStableState: WinConf = [:]
 	private var snapshotTimer: Timer?
 
 	// Diagnostics
+	// Always-on file logging (so logs exist even when launched as a Login Item / from Finder)
+	private var logFileURL: URL?
+	private var logFH: FileHandle?
+	private let logQueue = DispatchQueue(label: "de.relikd.Memmon.log", qos: .utility)
+	private let maxLogBytes: Int64 = 5 * 1024 * 1024 // 5 MiB
+
 	private let logDF: DateFormatter = {
 		let df = DateFormatter()
 		df.locale = Locale(identifier: "en_US_POSIX")
@@ -39,12 +57,84 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 	}()
 	private func log(_ msg: String) {
 		let ts = logDF.string(from: Date())
-		print("[Memmon] \(ts) \(msg)")
+		let line = "[Memmon] \(ts) \(msg)"
+		// Keep stdout for interactive debugging
+		print(line)
+		// And always append to our known log file
+		appendLogLine(line)
+	}
+
+	/// Initialize logging to a stable per-user location.
+	/// Location: ~/Library/Logs/Memmon/memmon.log
+	private func setupLogging() {
+		let fm = FileManager.default
+		guard let lib = fm.urls(for: .libraryDirectory, in: .userDomainMask).first else {
+			// If we cannot resolve the Library directory, we still have stdout logging.
+			return
+		}
+		let dir = lib.appendingPathComponent("Logs", isDirectory: true)
+			.appendingPathComponent("Memmon", isDirectory: true)
+		let file = dir.appendingPathComponent("memmon.log", isDirectory: false)
+		do {
+			try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+			if !fm.fileExists(atPath: file.path) {
+				fm.createFile(atPath: file.path, contents: nil)
+			}
+			self.logFileURL = file
+			self.logFH = try FileHandle(forWritingTo: file)
+			// Use legacy API so we compile with -target macos10.10
+			self.logFH?.seekToEndOfFile()
+			// Write a startup marker without calling log() (avoid recursion while setting up)
+			let ts = logDF.string(from: Date())
+			let v = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "?"
+			let b = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String) ?? "?"
+			let pid = getpid()
+			let ax = AXIsProcessTrusted()
+			let sig = self.displaySignature()
+			self.appendLogLine("[Memmon] \(ts) Logging started at \(file.path) v=\(v)\(b.isEmpty ? "" : "(\(b))") pid=\(pid) axTrusted=\(ax) screens=\(NSScreen.screens.count) separateSpaces=\(self.separateSpaces) sig=\(sig)")
+		} catch {
+			// Fall back silently to stdout.
+			self.logFileURL = nil
+			self.logFH = nil
+		}
+	}
+
+	private func rotateIfNeeded() {
+		guard let url = self.logFileURL else { return }
+		let fm = FileManager.default
+		guard let attrs = try? fm.attributesOfItem(atPath: url.path),
+			  let size = attrs[.size] as? NSNumber else { return }
+		let bytes = size.int64Value
+		guard bytes > self.maxLogBytes else { return }
+		// Close existing handle before rotating
+		if let fh = self.logFH {
+			fh.closeFile()
+		}
+		self.logFH = nil
+		let rotated = url.deletingLastPathComponent().appendingPathComponent("memmon.log.1")
+		_ = try? fm.removeItem(at: rotated)
+		_ = try? fm.moveItem(at: url, to: rotated)
+		fm.createFile(atPath: url.path, contents: nil)
+		self.logFH = try? FileHandle(forWritingTo: url)
+		// Use legacy API so we compile with -target macos10.10
+		self.logFH?.seekToEndOfFile()
+	}
+
+	private func appendLogLine(_ line: String) {
+		guard let data = (line + "\n").data(using: .utf8) else { return }
+		logQueue.async { [weak self] in
+			guard let self else { return }
+			self.rotateIfNeeded()
+			guard let fh = self.logFH else { return }
+			fh.write(data)
+		}
 	}
 
 	private var separateSpaces: Bool { NSScreen.screensHaveSeparateSpaces }
 
 	func applicationDidFinishLaunching(_ aNotification: Notification) {
+		// Ensure file logging exists even when launched from Finder / at login.
+		self.setupLogging()
 		self.currentSig = self.displaySignature()
 		self.lastStableSig = self.currentSig
 		log("Launch. screens=\(NSScreen.screens.count) sig=\(self.currentSig) separateSpaces=\(self.separateSpaces)")
@@ -52,8 +142,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 		// show Accessibility Permissions popup
 		AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() : true] as CFDictionary)
 
-		// Track space changes
-		NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(self.activeSpaceChanged), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
 
 		// Track sleep / wake
 		let wsnc = NSWorkspace.shared.notificationCenter
@@ -91,7 +179,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 			}
 		}
 		let menu = NSMenu(title: "")
-		menu.addItem(withTitle: "Memmon (v1.5)", action: nil, keyEquivalent: "")
+		let v = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "?"
+let b = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String) ?? "?"
+let title = "Memmon v\(v)" + (b == "?" || b.isEmpty ? "" : " (\(b))")
+menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
 		let saveItem = menu.addItem(withTitle: "Save Current Layout", action: #selector(self.menuSaveLayout), keyEquivalent: "s")
 		saveItem.target = self
 		let restoreItem = menu.addItem(withTitle: "Restore Saved Layout", action: #selector(self.menuRestoreLayout), keyEquivalent: "r")
@@ -135,8 +226,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 		let oldSig = self.currentSig
 		let newCount = NSScreen.screens.count
 		let newSig = self.displaySignature()
+		// Diagnostics: if displays were added, record when externals were detected and probe for wallpaper readiness
+		if newCount > oldCount {
+			self.externalsDetectedAt = Date()
+			log("Externals detected: oldCount=\(oldCount) newCount=\(newCount)")
+			self.startWallpaperProbe(reason: "screen-added")
+		}
+
 
 		log("Screen parameters changed: oldCount=\(oldCount) newCount=\(newCount) oldSig=\(oldSig) newSig=\(newSig)")
+
+			// If the computed signature does not reflect the observed screen count, emit diagnostic details.
+			let sigDisplays = newSig.split(separator: "\n".first!).count
+			if sigDisplays != newCount {
+				log("Warning: signature display count mismatch: screens=\(newCount) sigDisplays=\(sigDisplays) \(self.displayDebugSummary())")
+			}
+
 
 		// If displays were removed, macOS may already have collapsed windows; keep last stable snapshot for oldSig.
 		if newCount < oldCount {
@@ -147,8 +252,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 				log("Warning: no last stable snapshot available for oldSig=\(oldSig); not overwriting saved layout")
 			}
 		} else {
-			// For other changes, update the stored layout for the old config conservatively.
-			self.saveState(for: oldSig)
+			// During attach/rearrange (especially after wake), WindowServer may shuffle windows and screen UUIDs.
+			// Avoid overwriting a good multi-monitor layout with a transient 'all windows on laptop' state.
+			log("Skipping immediate auto save during display transition (will do deferred save after settle)")
 		}
 
 		self.numScreens = newCount
@@ -169,32 +275,227 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 	@objc private func screensDidWake(_ note: Notification) {
 		log("Screens did wake: scheduling restore")
+		// Diagnostics: wallpaper may take a while to appear after wake; probe readiness.
+		if NSScreen.screens.count > 1 {
+			self.externalsDetectedAt = Date()
+			self.startWallpaperProbe(reason: "screensDidWake")
+		}
 		self.scheduleRestoreDebounced(reason: "screensDidWake")
 	}
 
 	private func scheduleRestoreDebounced(reason: String) {
+		// Each screen-change increments a sequence so stale retries do nothing.
 		self.restoreDebounce?.cancel()
-		let work = DispatchWorkItem { [weak self] in
-			self?.restoreLayoutNow(reason: reason)
+		self.screenChangeSeq += 1
+		let seq = self.screenChangeSeq
+		self.lastScreenChangeAt = Date()
+		for (idx, delay) in self.settleRestoreDelays.enumerated() {
+			DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+				guard let self else { return }
+				guard self.screenChangeSeq == seq else { return }
+				self.restoreLayoutNow(reason: idx == 0 ? reason : "\(reason)-retry\(idx)")
+			}
 		}
-		self.restoreDebounce = work
-		DispatchQueue.main.asyncAfter(deadline: .now() + self.restoreDelay, execute: work)
+		// After displays settle, do a deferred save so the new signature gains a layout,
+		// but only if no newer screen change occurred.
+		DispatchQueue.main.asyncAfter(deadline: .now() + self.settleDeferredSaveDelay) { [weak self] in
+			guard let self else { return }
+			guard self.screenChangeSeq == seq else { return }
+			let sig = self.displaySignature()
+			self.saveState(for: sig)
+			self.log("Deferred auto save after settle: sig=\(sig)")
+		}
 	}
 
 	// MARK: - Helpers
-	private func displaySignature() -> DisplaySig {
-		// Include display ID and frame to distinguish same monitors in different arrangements.
-		let parts: [String] = NSScreen.screens.compactMap { s in
+
+	private func cgActiveDisplays() -> [(id: CGDirectDisplayID, uuid: String, bounds: CGRect)] {
+		let max: UInt32 = 16
+		var ids = [CGDirectDisplayID](repeating: 0, count: Int(max))
+		var count: UInt32 = 0
+		let err = CGGetActiveDisplayList(max, &ids, &count)
+		guard err == .success else { return [] }
+		let active = ids.prefix(Int(count))
+		var out: [(id: CGDirectDisplayID, uuid: String, bounds: CGRect)] = []
+		out.reserveCapacity(active.count)
+		for id in active {
+			var key = String(format: "%08X", id)
+			if let cfUUID = CGDisplayCreateUUIDFromDisplayID(id) {
+				key = (CFUUIDCreateString(nil, cfUUID.takeRetainedValue()) as String)
+			}
+			let b = CGDisplayBounds(id) // global pixel coordinates
+			out.append((id: id, uuid: key, bounds: b))
+		}
+		// Deterministic ordering across re-enumerations.
+		out.sort {
+			if $0.uuid != $1.uuid { return $0.uuid < $1.uuid }
+			if $0.bounds.origin.x != $1.bounds.origin.x { return $0.bounds.origin.x < $1.bounds.origin.x }
+			if $0.bounds.origin.y != $1.bounds.origin.y { return $0.bounds.origin.y < $1.bounds.origin.y }
+			if $0.bounds.size.width != $1.bounds.size.width { return $0.bounds.size.width < $1.bounds.size.width }
+			return $0.bounds.size.height < $1.bounds.size.height
+		}
+		return out
+	}
+
+	private func screenDisplays() -> [(id: CGDirectDisplayID, uuid: String, bounds: CGRect)] {
+		var out: [(id: CGDirectDisplayID, uuid: String, bounds: CGRect)] = []
+		out.reserveCapacity(NSScreen.screens.count)
+		for s in NSScreen.screens {
+			guard let idNum = s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { continue }
+			let id = CGDirectDisplayID(idNum.uint32Value)
+			var key = String(format: "%08X", id)
+			if let cfUUID = CGDisplayCreateUUIDFromDisplayID(id) {
+				key = (CFUUIDCreateString(nil, cfUUID.takeRetainedValue()) as String)
+			}
+			let b = CGDisplayBounds(id) // global pixel coordinates
+			out.append((id: id, uuid: key, bounds: b))
+		}
+		out.sort {
+			if $0.uuid != $1.uuid { return $0.uuid < $1.uuid }
+			if $0.bounds.origin.x != $1.bounds.origin.x { return $0.bounds.origin.x < $1.bounds.origin.x }
+			if $0.bounds.origin.y != $1.bounds.origin.y { return $0.bounds.origin.y < $1.bounds.origin.y }
+			if $0.bounds.size.width != $1.bounds.size.width { return $0.bounds.size.width < $1.bounds.size.width }
+			return $0.bounds.size.height < $1.bounds.size.height
+		}
+		return out
+	}
+
+	private func displayDebugSummary() -> String {
+		let nsParts: [String] = NSScreen.screens.enumerated().map { (idx, s) in
 			let idNum = s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
 			let id = idNum?.uint32Value ?? 0
 			let f = s.frame
-			return String(format: "%08X:%0.0f,%0.0f-%0.0fx%0.0f", id, f.origin.x, f.origin.y, f.size.width, f.size.height)
+			let scale = s.backingScaleFactor
+			return String(format: "ns[%d] id=%08X frame=%.0f,%.0f-%.0fx%.0f scale=%.2f", idx, id, f.origin.x, f.origin.y, f.size.width, f.size.height, scale)
 		}
-		return parts.joined(separator: "|")
+		let cg = self.cgActiveDisplays()
+		let cgParts: [String] = cg.map { d in
+			let b = d.bounds
+			return String(format: "cg id=%08X uuid=%@ bounds=%.0f,%.0f-%.0fx%.0f", d.id, d.uuid, b.origin.x, b.origin.y, b.size.width, b.size.height)
+		}
+		return "nsCount=\(NSScreen.screens.count) cgCount=\(cg.count) ns={\(nsParts.joined(separator: " | "))} cg={\(cgParts.joined(separator: " | "))}"
+	}
+
+	private func displaySignature() -> DisplaySig {
+		// Prefer NSScreen-derived display IDs (usually matches Spaces/display arrangement), using CG bounds.
+		let sd = self.screenDisplays()
+		if !sd.isEmpty {
+			let parts: [String] = sd.map { d in
+				let b = d.bounds
+				return String(format: "%@:%.0f,%.0f-%.0fx%.0f", d.uuid, b.origin.x, b.origin.y, b.size.width, b.size.height)
+			}
+			return parts.joined(separator: "\n")
+		}
+		// If NSScreen-derived IDs are temporarily unavailable, fall back to CoreGraphics active list.
+		let cg = self.cgActiveDisplays()
+		if !cg.isEmpty {
+			let parts: [String] = cg.map { d in
+				let b = d.bounds
+				return String(format: "%@:%.0f,%.0f-%.0fx%.0f", d.uuid, b.origin.x, b.origin.y, b.size.width, b.size.height)
+			}
+			return parts.joined(separator: "\n")
+		}
+	// Fallback (should be rare): derive from NSScreen.
+		let parts: [String] = NSScreen.screens.compactMap { s in
+			let idNum = s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+			let id = idNum?.uint32Value ?? 0
+			var key = String(format: "%08X", id)
+			if let cfUUID = CGDisplayCreateUUIDFromDisplayID(id) {
+				key = (CFUUIDCreateString(nil, cfUUID.takeRetainedValue()) as String)
+			}
+			let f = s.frame
+			return String(format: "%@:%.0f,%.0f-%.0fx%.0f", key, f.origin.x, f.origin.y, f.size.width, f.size.height)
+		}
+		return parts.joined(separator: "\n")
 	}
 
 	private func getWinIds(allSpaces: Bool = false) -> [WinNum] {
 		NSWindow.windowNumbers(options: allSpaces ? [.allApplications, .allSpaces] : .allApplications)?.map { $0.intValue } ?? []
+	}
+
+	// Try to find a previously saved layout even if the display IDs/signature changed (e.g., unplug/replug).
+	// We match by multiset of screen resolutions (WxH) to handle dock/display-ID churn.
+	private func sigSizes(_ sig: DisplaySig) -> [String] {
+		let lines = sig.split(separator: "\n")
+		var out: [String] = []
+		out.reserveCapacity(lines.count)
+		for l in lines {
+			if let dash = l.lastIndex(of: "-") {
+				let size = l[l.index(after: dash)...]
+				out.append(String(size))
+			}
+		}
+		return out.sorted()
+	}
+
+	private func bestMatchingSignature(for sig: DisplaySig) -> DisplaySig? {
+		let target = sigSizes(sig)
+		guard !target.isEmpty else { return nil }
+		for k in self.state.keys {
+			if sigSizes(k) == target { return k }
+		}
+		return nil
+	}
+
+	// MARK: - Wallpaper/desktop readiness diagnostics
+	// Heuristic: count visible "Desktop Picture" windows owned by Dock (and/or WallpaperAgent).
+	// This helps estimate when the desktop background has been restored on external displays.
+	private func desktopPictureWindowCount() -> Int {
+		let windowList = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as NSArray? as? [[String: AnyObject]]
+		guard let windowList else { return 0 }
+		var count = 0
+		for entry in windowList {
+			let owner = (entry[kCGWindowOwnerName as String] as? String) ?? ""
+			let name = (entry[kCGWindowName as String] as? String) ?? ""
+			// On most macOS versions, the desktop wallpaper windows are named "Desktop Picture" and owned by Dock.
+			if owner == "Dock" && name == "Desktop Picture" {
+				count += 1
+				continue
+			}
+			// Fallback for variants (some systems report WallpaperAgent-owned entries).
+			if owner.contains("Wallpaper") && name.contains("Desktop") {
+				count += 1
+			}
+		}
+		return count
+	}
+
+	private func startWallpaperProbe(reason: String) {
+		self.wallpaperProbeSeq += 1
+		let seq = self.wallpaperProbeSeq
+		let screens = NSScreen.screens.count
+		self.lastWallpaperWindowCount = -1
+		let start = Date()
+		let startMsg = self.externalsDetectedAt != nil ? "externalsDetectedAt=\(self.logDF.string(from: self.externalsDetectedAt!))" : "externalsDetectedAt=nil"
+		log("Wallpaper probe started (\(reason)): screens=\(screens) \(startMsg)")
+		func tick(_ elapsed: TimeInterval) {
+			guard self.wallpaperProbeSeq == seq else { return }
+			let c = self.desktopPictureWindowCount()
+			if c != self.lastWallpaperWindowCount {
+				self.lastWallpaperWindowCount = c
+				log("Wallpaper probe: elapsed=\(String(format: "%.1f", elapsed))s desktopPictureWindows=\(c) screens=\(NSScreen.screens.count)")
+			}
+			if c >= NSScreen.screens.count {
+				let doneAt = Date()
+				let dt = doneAt.timeIntervalSince(start)
+				if let extAt = self.externalsDetectedAt {
+					let extDt = doneAt.timeIntervalSince(extAt)
+					log("Wallpaper ready: dtSinceProbeStart=\(String(format: "%.1f", dt))s dtSinceExternalsDetected=\(String(format: "%.1f", extDt))s")
+				} else {
+					log("Wallpaper ready: dtSinceProbeStart=\(String(format: "%.1f", dt))s (externalsDetectedAt unknown)")
+				}
+				return
+			}
+			if elapsed >= self.wallpaperProbeTimeout {
+				log("Wallpaper probe timeout after \(String(format: "%.1f", elapsed))s; desktopPictureWindows=\(c) screens=\(NSScreen.screens.count)")
+				return
+			}
+			DispatchQueue.main.asyncAfter(deadline: .now() + self.wallpaperProbeInterval) { [weak self] in
+				guard self != nil else { return }
+				tick(Date().timeIntervalSince(start))
+			}
+		}
+		tick(0)
 	}
 
 	// MARK: - Save State (CGWindow)
@@ -267,10 +568,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 	private func restoreLayoutNow(reason: String) {
 		let sig = self.displaySignature()
 		self.currentSig = sig
-		let layout = self.state[sig]
-		log("Restore attempt (\(reason)): screens=\(NSScreen.screens.count) sig=\(sig) hasLayout=\(layout != nil) separateSpaces=\(self.separateSpaces)")
-		guard let layout else { return }
 
+		let sigDisplays = sig.split(separator: "\n".first!).count
+		let screenCount = NSScreen.screens.count
+		if sigDisplays != screenCount {
+			log("Warning: signature display count mismatch at restore: screens=\(screenCount) sigDisplays=\(sigDisplays) \(self.displayDebugSummary())")
+			return
+		}
+
+		let axTrusted = AXIsProcessTrusted()
+		var layout = self.state[sig]
+		var usedSig = sig
+		if layout == nil, let match = self.bestMatchingSignature(for: sig), let l = self.state[match] {
+			layout = l
+			usedSig = match
+			self.state[sig] = l
+			log("No exact layout for sig; using best-match layout from sig=\(match)")
+		}
+		log("Restore attempt (\(reason)): screens=\(NSScreen.screens.count) sig=\(sig) hasLayout=\(layout != nil) axTrusted=\(axTrusted) separateSpaces=\(self.separateSpaces)" + (usedSig == sig ? "" : " matchSig=\(usedSig)"))
+		guard let layout else { return }
+		if !axTrusted {
+			log("Warning: Accessibility not trusted; window moves will fail. Re-enable Memmon in System Settings > Privacy & Security > Accessibility.")
+		}
 		if !self.separateSpaces {
 			self.restoreLayoutAllAtOnce(layout)
 		} else {
@@ -306,6 +625,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 		guard sizes.count > 0 else { return }
 		let win = self.axWinList(pid)
 
+
 		if win.count != sizes.count {
 			log("AX window count mismatch for pid=\(pid): ax=\(win.count) saved=\(sizes.count) (best-effort apply min)")
 		}
@@ -324,25 +644,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 		let appRef = AXUIElementCreateApplication(pid)
 		var value: CFTypeRef?
 		AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &value)
-		if let windowList = value as? [AXUIElement] {
-			var tmp: [AXUIElement] = []
-			for win in windowList {
-				var role: CFTypeRef?
-				AXUIElementCopyAttributeValue(win, kAXRoleAttribute as CFString, &role)
-				if role as? String == kAXWindowRole {
-					tmp.append(win) // filter e.g. Finder's AXScrollArea
+		guard let windowList = value as? [AXUIElement] else { return [] }
+		var tmp: [AXUIElement] = []
+		// Some apps (notably Finder) can expose non-window elements (e.g., AXScrollArea) in the windows list.
+		// If we encounter a scroll area, resolve its containing AXWindow via kAXWindowAttribute.
+		func appendUnique(_ el: AXUIElement) {
+			if !tmp.contains(where: { $0 as CFTypeRef === el as CFTypeRef }) {
+				tmp.append(el)
+			}
+		}
+		for el in windowList {
+			var roleRef: CFTypeRef?
+			AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &roleRef)
+			let role = roleRef as? String
+			if role == kAXWindowRole {
+				appendUnique(el)
+				continue
+			}
+			if role == kAXScrollAreaRole {
+				var winRef: CFTypeRef?
+				AXUIElementCopyAttributeValue(el, kAXWindowAttribute as CFString, &winRef)
+				if let winRef = winRef, CFGetTypeID(winRef) == AXUIElementGetTypeID() {
+					let winEl = winRef as! AXUIElement
+					appendUnique(winEl)
 				}
 			}
-			return tmp
 		}
-		return []
+		return tmp
 	}
 
 	// MARK: - Space Management
-	@objc func activeSpaceChanged(_ notification: Notification) {
-		// Space changes can occur during wake / replug; debounce restores.
-		self.scheduleRestoreDebounced(reason: "space-changed")
-	}
 
 	private func currentSpace() -> SpaceId? {
 		let thisSpace = self.getWinIds()
@@ -370,6 +701,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 		self.spacesAll.append(win.windowNumber)
 		return win.windowNumber
 	}
+	func applicationWillTerminate(_ notification: Notification) {
+		// Close file handle cleanly.
+		logQueue.sync {
+			if let fh = self.logFH {
+			fh.closeFile()
+		}
+			self.logFH = nil
+		}
+	}
+
 }
 
 // MARK: - Status Bar Icon
@@ -415,7 +756,14 @@ extension NSImage {
 }
 
 // MARK: - Main Entry
-let delegate = AppDelegate()
-NSApplication.shared.delegate = delegate
-NSApplication.shared.run()
+if #available(macOS 10.12, *) {
+    let delegate = AppDelegate()
+    NSApplication.shared.delegate = delegate
+    NSApplication.shared.run()
+} else {
+    // Fallback for macOS versions earlier than 10.12
+    print("AppDelegate is not available on macOS versions earlier than 10.12")
+    // Implement alternative entry point or fatal error
+    fatalError("Unsupported macOS version")
+}
 // _ = NSApplicationMain(CommandLine.argc, CommandLine.unsafeArgv)

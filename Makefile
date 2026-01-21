@@ -8,6 +8,7 @@ endif
 
 PLIST=$(shell grep -A1 $(1) src/Info.plist | tail -1 | cut -d'>' -f2 | cut -d'<' -f1)
 HAS_SIGN_IDENTITY=$(shell security find-identity -v -p codesigning | grep -q "Apple Development" && echo 1 || echo 0)
+BUILD_NUM=$(shell git rev-list --count HEAD 2>/dev/null || echo 1)
 
 
 Memmon.app: SDK_PATH=$(shell xcrun --show-sdk-path --sdk macosx)
@@ -23,6 +24,7 @@ Memmon.app: src/*
 	@mkdir -p Memmon.app/Contents/Resources/
 	@cp src/AppIcon.icns Memmon.app/Contents/Resources/AppIcon.icns
 	@cp src/Info.plist Memmon.app/Contents/Info.plist
+	@/usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUM}" Memmon.app/Contents/Info.plist
 	@touch Memmon.app
 	@echo
 ifeq ($(HAS_SIGN_IDENTITY),1)
