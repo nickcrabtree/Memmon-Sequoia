@@ -96,7 +96,9 @@ Key type aliases:
 
 Internal state:
 - numScreens: current count of attached screens.
-- state: dictionary keyed by numScreens, mapping to a WinConf snapshot. This lets Memmon maintain separate window layouts for different monitor setups.
+- state: dictionary keyed by display signature (one "UUID:x,y-WxH" line per display), mapping to a WinConf snapshot. This lets Memmon maintain separate window layouts for different monitor setups. Frames are in global coordinates, so a layout fits only the arrangement in its key. macOS keeps a separate arrangement for every set of connected displays, so the same monitor has a different origin depending on what else is plugged in.
+- stateSavedAt: when each layout was last saved from real window positions.
+- Borrowing a layout: when the current signature has no layout, restoreLayoutNow borrows one from a signature whose displays correspond one-to-one (bestLayoutSource / mapDisplays: same UUID first, then same size taken left to right; most displays in common wins, then most recently saved). translateLayout moves each frame by the offset between its saved display's origin and the corresponding current display's origin, and the result is stored under the current signature.
 - spacesAll: ordered list of synthetic window identifiers used to track known spaces.
 - spacesVisited: set of window numbers representing spaces that have been visited (activated) since the last configuration change.
 - spacesNeedRestore: set of spaces that should have their windows restored the next time they become active.

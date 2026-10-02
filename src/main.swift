@@ -33,6 +33,98 @@ func pairSavedFrames<W>(_ saved: [WinPos], _ live: [(WinNum, W)]) -> (matched: [
 	return (matched, unmatched)
 }
 
+// MARK: - Layouts across display configurations
+// Window frames are saved in global coordinates, so a layout only fits the display arrangement it was
+// saved under. macOS keeps a separate arrangement for every set of connected displays, so the same
+// monitor sits at a different origin depending on what else is plugged in.
+
+typealias DisplayFrame = (uuid: String, bounds: CGRect)
+
+/// The displays of a signature (one "UUID:x,y-WxH" line per display).
+func sigDisplays(_ sig: DisplaySig) -> [DisplayFrame] {
+	var out: [DisplayFrame] = []
+	for line in sig.split(separator: "\n") {
+		guard let colon = line.firstIndex(of: ":"), let dash = line.lastIndex(of: "-") else { continue }
+		let origin = line[line.index(after: colon) ..< dash].split(separator: ",").compactMap { Double($0) }
+		let size = line[line.index(after: dash)...].split(separator: "x").compactMap { Double($0) }
+		guard origin.count == 2, size.count == 2 else { continue }
+		out.append((String(line[..<colon]), CGRect(x: origin[0], y: origin[1], width: size[0], height: size[1])))
+	}
+	return out
+}
+
+/// Pair every display of a saved configuration with a display of the current one.
+/// nil unless each display finds a partner of its own size.
+func mapDisplays(_ saved: [DisplayFrame], _ current: [DisplayFrame]) -> [(from: DisplayFrame, to: DisplayFrame)]? {
+	guard saved.count == current.count else { return nil }
+	var pairs: [(from: DisplayFrame, to: DisplayFrame)] = []
+	var free = current
+	var unpaired: [DisplayFrame] = []
+	// The same physical display, where it is still connected ...
+	for s in saved {
+		if let i = free.firstIndex(where: { $0.uuid == s.uuid && $0.bounds.size == s.bounds.size }) {
+			pairs.append((from: s, to: free.remove(at: i)))
+		} else {
+			unpaired.append(s)
+		}
+	}
+	// ... otherwise a display of the same size, taking both sides left to right.
+	let leftToRight: (DisplayFrame, DisplayFrame) -> Bool = {
+		$0.bounds.minX != $1.bounds.minX ? $0.bounds.minX < $1.bounds.minX : $0.bounds.minY < $1.bounds.minY
+	}
+	free.sort(by: leftToRight)
+	for s in unpaired.sorted(by: leftToRight) {
+		guard let i = free.firstIndex(where: { $0.bounds.size == s.bounds.size }) else { return nil }
+		pairs.append((from: s, to: free.remove(at: i)))
+	}
+	return pairs
+}
+
+/// Move a frame saved under one display arrangement to the same place on its display in another.
+func translateFrame(_ frame: CGRect, _ displays: [(from: DisplayFrame, to: DisplayFrame)]) -> CGRect {
+	if frame.isEmpty { return frame } // dummy elements stay dummies
+	// The window belongs to the display holding most of it, or failing that the nearest one.
+	func overlap(_ d: CGRect) -> CGFloat {
+		let i = d.intersection(frame)
+		return i.isNull ? 0 : i.width * i.height
+	}
+	func distance(_ d: CGRect) -> CGFloat {
+		let dx = max(d.minX - frame.midX, 0, frame.midX - d.maxX)
+		let dy = max(d.minY - frame.midY, 0, frame.midY - d.maxY)
+		return dx * dx + dy * dy
+	}
+	var home = displays.max { overlap($0.from.bounds) < overlap($1.from.bounds) }
+	if let h = home, overlap(h.from.bounds) == 0 {
+		home = displays.min { distance($0.from.bounds) < distance($1.from.bounds) }
+	}
+	guard let h = home else { return frame }
+	return frame.offsetBy(dx: h.to.bounds.minX - h.from.bounds.minX, dy: h.to.bounds.minY - h.from.bounds.minY)
+}
+
+/// A layout saved under one signature, expressed in the coordinates of another. nil if the displays do not correspond.
+func translateLayout(_ layout: WinConf, from: DisplaySig, to: DisplaySig) -> WinConf? {
+	guard let displays = mapDisplays(sigDisplays(from), sigDisplays(to)) else { return nil }
+	var out: WinConf = [:]
+	for (pid, wins) in layout {
+		out[pid] = wins.map { ($0.0, translateFrame($0.1, displays)) }
+	}
+	return out
+}
+
+/// Which saved layout to borrow for a signature that has none of its own: one whose displays correspond
+/// to the current ones, preferring the most displays in common, then the most recently saved.
+func bestLayoutSource(for sig: DisplaySig, among saved: [(sig: DisplaySig, savedAt: Date)]) -> DisplaySig? {
+	let target = sigDisplays(sig)
+	var best: (sig: DisplaySig, shared: Int, savedAt: Date)?
+	for s in saved {
+		guard let pairs = mapDisplays(sigDisplays(s.sig), target) else { continue }
+		let shared = pairs.filter { $0.from.uuid == $0.to.uuid }.count
+		if let b = best, (b.shared, b.savedAt) >= (shared, s.savedAt) { continue }
+		best = (s.sig, shared, s.savedAt)
+	}
+	return best?.sig
+}
+
 // MARK: - Self Test (make test)
 func runSelfTest() -> Bool {
 	var failures = 0
@@ -62,6 +154,54 @@ func runSelfTest() -> Bool {
 	check("live window listed twice is set once", pairSavedFrames(saved, [(168, "a"), (168, "a2"), (170, "b"), (174, "c")]),
 		  ["a": small, "b": big, "c": mid], [])
 	check("no live windows", pairSavedFrames(saved, [(WinNum, String)]()), [:], [168, 170, 174])
+
+	func expect<T: Equatable>(_ name: String, _ got: T, _ want: T) {
+		let ok = got == want
+		if !ok { failures += 1 }
+		print("\(ok ? "ok  " : "FAIL") \(name)" + (ok ? "" : ": got=\(got) want=\(want)"))
+	}
+	// L = laptop, A and B = two identical 4K monitors. Each set of displays has its own arrangement.
+	let l = "37D8832A:0,0-1920x1243"
+	let la = l + "\n4989187D:-887,-2160-3840x2160"
+	let lb = l + "\n94593581:1920,-2160-3840x2160"
+	let lab = l + "\n4989187D:-975,-2160-3840x2160\n94593581:2865,-2160-3840x2160"
+	let labOld = l + "\n4989187D:-1277,-2160-3840x2160\n94593581:2563,-2160-3840x2160"
+	let labSwapped = l + "\n4989187D:2735,-2160-3840x2160\n94593581:-1105,-2160-3840x2160"
+	let laLowRes = l + "\n4989187D:-887,-1080-1920x1080"
+	func moved(_ frame: CGRect, _ from: DisplaySig, _ to: DisplaySig) -> CGRect? {
+		return translateLayout([1: [(7, frame)]], from: from, to: to)?[1]?.first?.1
+	}
+
+	expect("signature parses, including negative origins", sigDisplays(la).map { "\($0.uuid) \($0.bounds)" },
+		   ["37D8832A \(CGRect(x: 0, y: 0, width: 1920, height: 1243))", "4989187D \(CGRect(x: -887, y: -2160, width: 3840, height: 2160))"])
+	expect("signature parses with full display UUIDs",
+		   sigDisplays("37D8832A-2D66-02CA-B9F7-8F30A301B230:0,0-1920x1243\n4989187D-7DEA-4874-A1A3-DDDC1E3A5AC5:-975,-2160-3840x2160").map { "\($0.uuid) \($0.bounds)" },
+		   ["37D8832A-2D66-02CA-B9F7-8F30A301B230 \(CGRect(x: 0, y: 0, width: 1920, height: 1243))", "4989187D-7DEA-4874-A1A3-DDDC1E3A5AC5 \(CGRect(x: -975, y: -2160, width: 3840, height: 2160))"])
+	expect("window on the only external follows it to the other external's position",
+		   moved(CGRect(x: -800, y: -2000, width: 700, height: 150), la, lb), CGRect(x: 2007, y: -2000, width: 700, height: 150))
+	expect("window on the laptop screen stays put",
+		   moved(CGRect(x: 100, y: 100, width: 700, height: 150), la, lb), CGRect(x: 100, y: 100, width: 700, height: 150))
+	expect("same displays at shifted origins: window on A shifts with A",
+		   moved(CGRect(x: -1277, y: -2160, width: 1000, height: 800), labOld, lab), CGRect(x: -975, y: -2160, width: 1000, height: 800))
+	expect("same displays at shifted origins: window on B shifts with B",
+		   moved(CGRect(x: 3000, y: -1000, width: 1000, height: 800), labOld, lab), CGRect(x: 3302, y: -1000, width: 1000, height: 800))
+	expect("monitors swapped left/right: window follows its own monitor",
+		   moved(CGRect(x: -900, y: -2100, width: 1000, height: 800), lab, labSwapped), CGRect(x: 2810, y: -2100, width: 1000, height: 800))
+	expect("window straddling two displays goes with the one holding most of it",
+		   moved(CGRect(x: 2565, y: -2000, width: 1000, height: 800), lab, labOld), CGRect(x: 2263, y: -2000, width: 1000, height: 800))
+	expect("window off every display goes with the nearest one",
+		   moved(CGRect(x: 7000, y: -2000, width: 500, height: 500), lab, labOld), CGRect(x: 6698, y: -2000, width: 500, height: 500))
+	expect("dummy frame stays a dummy", moved(CGRect.zero, la, lb), CGRect.zero)
+	expect("no translation when a display has no partner of its own size", moved(small, laLowRes, la) == nil, true)
+	expect("no translation between different numbers of displays", moved(small, lab, la) == nil, true)
+
+	let t0 = Date(timeIntervalSince1970: 0), t1 = Date(timeIntervalSince1970: 100)
+	expect("borrow from the other single-external layout", bestLayoutSource(for: lb, among: [(lab, t1), (laLowRes, t1), (la, t0)]), la)
+	expect("prefer a layout saved with the same monitors over a newer one with others",
+		   bestLayoutSource(for: lab, among: [(l + "\nXXXX:-975,-2160-3840x2160\nYYYY:2865,-2160-3840x2160", t1), (labOld, t0)]), labOld)
+	expect("among equals, borrow the most recently saved", bestLayoutSource(for: lab, among: [(labOld, t0), (labSwapped, t1)]), labSwapped)
+	expect("nothing to borrow", bestLayoutSource(for: lab, among: [(la, t1), (l, t1)]), nil)
+
 	print(failures == 0 ? "self-test passed" : "self-test FAILED (\(failures))")
 	return failures == 0
 }
@@ -72,6 +212,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 	private var numScreens: Int = NSScreen.screens.count
 	private var currentSig: DisplaySig = ""
 	private var state: [DisplaySig: WinConf] = [:] // [display-signature: [pid: [windows]]]
+	private var stateSavedAt: [DisplaySig: Date] = [:] // when each layout was last saved from real window positions
 	private var spacesAll: [SpaceId] = [] // keep forever (and keep order)
 	private var spacesVisited: Set<WinNum> = [] // fill-up on space-switch
 	private var spacesNeedRestore: Set<SpaceId> = [] // dropped after restore
@@ -260,6 +401,7 @@ menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
 		let sig = self.displaySignature()
 		let snap = self.getState()
 		self.state[sig] = snap
+		self.stateSavedAt[sig] = Date()
 		self.currentSig = sig
 		self.numScreens = NSScreen.screens.count
 		log("Manual save: screens=\(self.numScreens) sig=\(sig) apps=\(snap.count)")
@@ -304,6 +446,7 @@ menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
 		if newCount < oldCount {
 			if self.lastStableSig == oldSig && !self.lastStableState.isEmpty {
 				self.state[oldSig] = self.lastStableState
+				self.stateSavedAt[oldSig] = Date()
 				log("Preserved last stable snapshot for removed config sig=\(oldSig) apps=\(self.lastStableState.count)")
 			} else {
 				log("Warning: no last stable snapshot available for oldSig=\(oldSig); not overwriting saved layout")
@@ -489,27 +632,9 @@ menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
 	}
 
 	// Try to find a previously saved layout even if the display IDs/signature changed (e.g., unplug/replug).
-	// We match by multiset of screen resolutions (WxH) to handle dock/display-ID churn.
-	private func sigSizes(_ sig: DisplaySig) -> [String] {
-		let lines = sig.split(separator: "\n")
-		var out: [String] = []
-		out.reserveCapacity(lines.count)
-		for l in lines {
-			if let dash = l.lastIndex(of: "-") {
-				let size = l[l.index(after: dash)...]
-				out.append(String(size))
-			}
-		}
-		return out.sorted()
-	}
-
+	// The displays must correspond one-to-one by size; the caller translates the frames (translateLayout).
 	private func bestMatchingSignature(for sig: DisplaySig) -> DisplaySig? {
-		let target = sigSizes(sig)
-		guard !target.isEmpty else { return nil }
-		for k in self.state.keys {
-			if sigSizes(k) == target { return k }
-		}
-		return nil
+		return bestLayoutSource(for: sig, among: self.state.keys.map { ($0, self.stateSavedAt[$0] ?? Date.distantPast) })
 	}
 
 	// MARK: - Wallpaper/desktop readiness diagnostics
@@ -605,6 +730,7 @@ menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
 			}
 		}
 		self.state[sig] = tmp_state
+		self.stateSavedAt[sig] = Date()
 	}
 
 	private func getState() -> WinConf {
@@ -660,11 +786,12 @@ menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
 		let axTrusted = AXIsProcessTrusted()
 		var layout = self.state[sig]
 		var usedSig = sig
-		if layout == nil, let match = self.bestMatchingSignature(for: sig), let l = self.state[match] {
-			layout = l
+		if layout == nil, let match = self.bestMatchingSignature(for: sig), let l = self.state[match],
+		   let moved = translateLayout(l, from: match, to: sig) {
+			layout = moved
 			usedSig = match
-			self.state[sig] = l
-			log("No exact layout for sig; using best-match layout from sig=\(match)")
+			self.state[sig] = moved
+			log("No exact layout for sig; using best-match layout from sig=\(match), moved to the current display positions")
 		}
 		log("Restore attempt (\(reason)): screens=\(NSScreen.screens.count) sig=\(sig) hasLayout=\(layout != nil) axTrusted=\(axTrusted) separateSpaces=\(self.separateSpaces)" + (usedSig == sig ? "" : " matchSig=\(usedSig)"))
 		guard let layout else {
