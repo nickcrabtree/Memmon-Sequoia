@@ -22,6 +22,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 	private var spacesVisited: Set<WinNum> = [] // fill-up on space-switch
 	private var spacesNeedRestore: Set<SpaceId> = [] // dropped after restore
 
+	// Dirty flag: only restore if display configuration actually changed
+	private var layoutDirty: Bool = false
+
 	// Debounced restore
 	private var restoreDebounce: DispatchWorkItem?
 	private let restoreDelay: TimeInterval = 1.6
@@ -260,6 +263,8 @@ menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
 		self.numScreens = newCount
 		self.currentSig = newSig
 		self.spacesVisited.removeAll(keepingCapacity: true)
+		// Mark layout as dirty since display configuration changed
+		self.layoutDirty = true
 		self.scheduleRestoreDebounced(reason: "screen-change")
 	}
 
@@ -269,18 +274,34 @@ menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
 	}
 
 	@objc private func didWake(_ note: Notification) {
-		log("Did wake: scheduling restore")
-		self.scheduleRestoreDebounced(reason: "didWake")
+		// Check if display configuration changed during sleep
+		let wakeSig = self.displaySignature()
+		let wakeCount = NSScreen.screens.count
+		if wakeSig != self.currentSig || wakeCount != self.numScreens {
+			log("Did wake: display config changed (old=\(self.numScreens) new=\(wakeCount)), scheduling restore")
+			self.layoutDirty = true
+			self.scheduleRestoreDebounced(reason: "didWake")
+		} else {
+			log("Did wake: display config unchanged, skipping restore")
+		}
 	}
 
 	@objc private func screensDidWake(_ note: Notification) {
-		log("Screens did wake: scheduling restore")
-		// Diagnostics: wallpaper may take a while to appear after wake; probe readiness.
-		if NSScreen.screens.count > 1 {
-			self.externalsDetectedAt = Date()
-			self.startWallpaperProbe(reason: "screensDidWake")
+		// Check if display configuration changed
+		let wakeSig = self.displaySignature()
+		let wakeCount = NSScreen.screens.count
+		if wakeSig != self.currentSig || wakeCount != self.numScreens {
+			log("Screens did wake: display config changed (old=\(self.numScreens) new=\(wakeCount)), scheduling restore")
+			// Diagnostics: wallpaper may take a while to appear after wake; probe readiness.
+			if wakeCount > 1 {
+				self.externalsDetectedAt = Date()
+				self.startWallpaperProbe(reason: "screensDidWake")
+			}
+			self.layoutDirty = true
+			self.scheduleRestoreDebounced(reason: "screensDidWake")
+		} else {
+			log("Screens did wake: display config unchanged, skipping restore")
 		}
-		self.scheduleRestoreDebounced(reason: "screensDidWake")
 	}
 
 	private func scheduleRestoreDebounced(reason: String) {
@@ -566,6 +587,12 @@ menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
 
 	// MARK: - Restore State (AXUIElement)
 	private func restoreLayoutNow(reason: String) {
+		// Only restore if layout was explicitly marked dirty (display config changed)
+		if !self.layoutDirty && !reason.starts(with: "manual") {
+			log("Restore skipped (\(reason)): layout not dirty, no display change detected")
+			return
+		}
+
 		let sig = self.displaySignature()
 		self.currentSig = sig
 
@@ -586,10 +613,19 @@ menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
 			log("No exact layout for sig; using best-match layout from sig=\(match)")
 		}
 		log("Restore attempt (\(reason)): screens=\(NSScreen.screens.count) sig=\(sig) hasLayout=\(layout != nil) axTrusted=\(axTrusted) separateSpaces=\(self.separateSpaces)" + (usedSig == sig ? "" : " matchSig=\(usedSig)"))
-		guard let layout else { return }
+		guard let layout else {
+			// No layout to restore, clear dirty flag
+			self.layoutDirty = false
+			return
+		}
 		if !axTrusted {
 			log("Warning: Accessibility not trusted; window moves will fail. Re-enable Memmon in System Settings > Privacy & Security > Accessibility.")
+			// Still clear dirty flag even if we can't restore, to avoid repeated attempts
+			self.layoutDirty = false
+			return
 		}
+		// Clear dirty flag before attempting restore
+		self.layoutDirty = false
 		if !self.separateSpaces {
 			self.restoreLayoutAllAtOnce(layout)
 		} else {
@@ -625,10 +661,17 @@ menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
 		guard sizes.count > 0 else { return }
 		let win = self.axWinList(pid)
 
-
+		// Handle window count mismatch: apply saved positions to all available windows
 		if win.count != sizes.count {
-			log("AX window count mismatch for pid=\(pid): ax=\(win.count) saved=\(sizes.count) (best-effort apply min)")
+			if win.count == 0 {
+				// AX reports no windows (may be minimized or not yet visible)
+				log("AX window count mismatch for pid=\(pid): ax=0 saved=\(sizes.count) (windows not accessible, skipping)")
+				return
+			}
+			log("AX window count mismatch for pid=\(pid): ax=\(win.count) saved=\(sizes.count) (applying to min=\(min(win.count, sizes.count)))")
 		}
+
+		// Restore positions for all windows we have both AX and saved data for
 		let count = min(win.count, sizes.count)
 		for i in 0 ..< count {
 			var rect = sizes[i].1
