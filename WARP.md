@@ -106,12 +106,14 @@ Internal state:
 Lifecycle hooks:
 - applicationDidFinishLaunching:
   - Prompts for Accessibility permissions using AXIsProcessTrustedWithOptions.
-  - Subscribes to NSWorkspace.activeSpaceDidChangeNotification to react to space switches.
+  - Subscribes to sleep and wake notifications (willSleep, didWake, screensDidWake).
+  - Starts the 2 s snapshot timer that keeps lastStableState current.
   - Initializes the current space tracking and marks any existing windows as visited.
   - Configures the status bar item and its menu based on a user default named "icon".
 - applicationDidChangeScreenParameters:
   - Triggered when displays are attached/detached or their configuration changes.
-  - Saves the current window state, updates the screen count, resets visited spaces, and then attempts a restore.
+  - Does not save at this point, because macOS may already have moved windows. If displays were removed, the last 2 s snapshot becomes the layout of the configuration that went away.
+  - Updates the screen count and signature, resets visited spaces, sets layoutDirty and schedules a restore (see "What happens on a display change").
 
 State capture and merging:
 - getWinIds(allSpaces:): uses NSWindow.windowNumbers to get window numbers across the current space or all spaces.
@@ -121,8 +123,8 @@ State capture and merging:
   - Builds a WinConf mapping from app PID to ordered lists of WinPos, preserving activity order within each app.
 - saveState():
   - Marks all known spaces as needing restore.
-  - Ensures there is an entry in state for the current screen count.
-  - Merges the latest snapshot from getState() into the per-screen-count dictionary.
+  - Ensures there is an entry in state for the given display signature.
+  - Merges the latest snapshot from getState() into that signature's layout.
   - For the current screen configuration, updates positions for windows in spaces that have been visited, while preserving older positions for unvisited spaces via a dummy placeholder mechanism.
 
 This design ensures:
@@ -178,6 +180,7 @@ The UI for Memmon is intentionally minimal and consists solely of a menu bar ite
 
 The AppDelegate constructs an NSStatusItem, sets its image according to the selected style, and attaches an NSMenu with:
 - A title item showing the current version string.
+- Save Current Layout and Restore Saved Layout, which act on the current display signature; a manual restore runs even when layoutDirty is clear.
 - An item to hide the status icon (enableInvisbleMode), which drops the reference to the status item.
 - A Quit item wired to NSApp.terminate.
 
@@ -200,13 +203,79 @@ At the bottom of src/main.swift, the main entry wires everything together:
 
 Info.plist configures the process as a background-only UI element (LSBackgroundOnly and LSUIElement set to true), so the app runs without a Dock icon and is primarily interacted with via the status bar (when not in invisible mode).
 
+## Operations and troubleshooting
+
+Start here when Memmon misbehaves. Everything below was established on 2026-10-02 (macOS 26.6.2).
+
+### Where things are
+
+- Source: ~/code/Memmon-Sequoia, a clone of github.com/nickcrabtree/Memmon-Sequoia (public fork of relikd/Memmon), branch main. The former working copy ~/soft/Memmon no longer exists; shell history that mentions it (~/.directory_history/Users/nickc/soft/Memmon/history) refers to this repository.
+- Installed app: /Applications/Memmon.app. The build number (CFBundleVersion) is the git commit count at build time, so `git rev-list --count HEAD` tells you whether the installed build matches HEAD. A build made from uncommitted changes carries the count of the commit below it.
+- Log: ~/Library/Logs/Memmon/memmon.log (rotated to memmon.log.1 at 5 MiB). Every launch writes a "Logging started" line with version, build, pid and axTrusted.
+- Layouts are held in memory only. Restarting Memmon forgets them all; it relearns each arrangement as it sees it.
+
+### Deploy a new build
+
+Commit first, so the build number is right, then:
+
+1. make clean && make
+2. make test
+3. pgrep -fl Memmon.app, then kill that exact pid
+4. mv /Applications/Memmon.app ~/tmp/Memmon.app.build<N> (keeps the old build, with its signature, for rollback)
+5. cp -R Memmon.app /Applications/ && open -a Memmon
+6. Re-enable Memmon in System Settings > Privacy & Security > Accessibility. The signature is ad hoc, so every build has a new code hash and macOS forgets the grant. If the toggle does not stick: tccutil reset Accessibility de.relikd.Memmon, then relaunch.
+7. Check the "Logging started" line shows the new build and axTrusted=true. With axTrusted=false, restores return early and do nothing.
+
+### What happens on a display change
+
+- Every 2 s a timer snapshots all window frames under the current signature (lastStableState).
+- Displays removed: the last snapshot becomes the layout of the configuration that just went away ("Preserved last stable snapshot").
+- Any change: one restore runs 1.6 s after the last change in a burst. The later retries (8, 20, 40, 70 s) log "Restore skipped ... layout not dirty" because the first attempt clears the layoutDirty flag.
+- 75 s after the last change, the current positions are saved as the layout of the current signature ("Deferred auto save after settle").
+- Wake from sleep schedules a restore only if the signature differs from the one before sleep.
+
+### Reading the log
+
+- Signatures span several lines, one display per line; continuation lines start with a display UUID. Filter them out with rg -v '^[0-9A-F]{8}-' to get one line per event.
+- "Restore attempt (...) hasLayout=true": frames were applied. With "matchSig=", the layout was borrowed and translated.
+- "AX window mismatch for pid=N: ax=0 ...": the app exposed no windows to the Accessibility API, so none of its windows were restored. Aquamacs does this consistently.
+- "AX window mismatch ... (no AX window for saved winNums=[...])": those saved windows have gone (closed, or not exposed); the rest were restored.
+- ps -p <pid> -o comm= names the app behind a pid.
+
+### Display arrangements on Nick's desk
+
+macOS stores one arrangement per set of connected displays, so a monitor's origin depends on what else is connected; it does not drift. As of 2026-10-02 (laptop 37D8832A at 0,0-1920x1243; two 3840x2160 monitors):
+
+| Connected | 4989187D (left) | 94593581 (right) |
+|---|---|---|
+| laptop + both | -975,-2160 | 2865,-2160 |
+| laptop + left | -887,-2160 | |
+| laptop + right | | 1920,-2160 |
+
+Plugging and unplugging pass through the two-display sets for a few seconds, because the monitors appear and disappear one at a time. Changing dock or cable can make macOS create new arrangements (2026-09-18: a dozen within an hour while trying docks and cables).
+
+### Known limitations
+
+- A snapshot taken while the Mac is passing through an intermediate display set becomes that set's layout when the next display is removed. A later real session on that set starts from those transit positions.
+- Only the first restore after a change does anything, so an app whose windows are not accessible at that moment is not retried.
+- Apps that expose no AX windows (Aquamacs) are never restored.
+- _AXUIElementGetWindow is private API. If it ever stops resolving window numbers, axWinList returns nothing and every app logs "ax=0".
+- "Displays have separate Spaces" is off on this Mac (separateSpaces=false), so restoreLayoutAllAtOnce is the path in use; the per-space path (restoreState) is not exercised here.
+
+### Change history
+
+- Build 17 (2026-01-26, committed 2026-10-02 as cd48917): restore only when the display configuration really changed (layoutDirty); skip apps with no AX windows.
+- Build 20 (2026-10-02, 36926dd and 029550b): saved frames are paired with windows by window number, where they were previously paired by list position, which gave windows each other's frames (Terminal windows shrunk to the size of a small one). Borrowed layouts are translated per display, where they were previously applied with another arrangement's coordinates.
+- How to investigate a new complaint: get the time of the event, read the log around it, and compare what was restored with what the user saw. A small Swift probe that prints each app's AX windows with their window numbers and frames (AXIsProcessTrusted is inherited from the terminal) settles most questions about what Memmon can see.
+
 ## Notes for future changes
 
 - When adding new features or refactoring, keep in mind that all user-visible behavior is currently driven through NSApplicationDelegate and background event handling; there is no separate model or controller layer.
 - If you introduce additional source files, update the Makefile target dependencies and swiftc invocation accordingly, since they currently only compile src/main.swift.
+- Logic that can be tested without moving windows (pairing, signature parsing, layout translation) lives in free functions at the top of src/main.swift, with its tests in runSelfTest(). Add the failing test there first.
 - Before publishing a new release tarball, update CFBundleShortVersionString and CFBundleVersion in src/Info.plist so that the release target names the archive correctly and the menu title version string remains accurate.
 
 ## Host environment
 
-- As of 2025-12-28, this repository is being developed on macOS 15.7.2, as reported by sw_vers -productVersion on the current machine.
+- As of 2026-10-02, this repository is being developed on macOS 26.6.2, as reported by sw_vers -productVersion on the current machine (macOS 15.7.2 on 2025-12-28).
 - The app’s minimum deployment target remains macOS 10.10, per LSMinimumSystemVersion in src/Info.plist.
