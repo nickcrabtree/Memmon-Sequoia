@@ -35,6 +35,13 @@ The Makefile attempts to sign the app with an "Apple Development" identity if on
 
 You normally do not need to run codesign manually; rerunning make will rebuild and re-sign.
 
+### Run the self-test
+
+- Check the frame-to-window pairing logic (no Accessibility permission needed, moves no windows):
+  - make test
+
+The tests live in runSelfTest() in src/main.swift and run when the binary is started with --self-test.
+
 ### Clean build artifacts
 
 - Remove the built app and intermediate binaries:
@@ -131,13 +138,15 @@ Restoration is performed via macOS Accessibility APIs (AXUIElement) and is coord
   - Calls setWindowSizes for each app to resize and reposition its windows.
 
 - setWindowSizes(pid, sizes):
-  - Builds a filtered list of AXUIElement windows for the given process using axWinList.
-  - Requires a one-to-one mapping between stored sizes and actual windows to avoid misalignment.
-  - For each window, constructs AXValue instances for position and size and sets kAXPositionAttribute and kAXSizeAttribute.
+  - Builds a list of (window number, AXUIElement) pairs for the given process using axWinList.
+  - Pairs each stored frame with the AX window that has the same window number (pairSavedFrames). List position is never used: both lists are in z-order, which changes with every click, so pairing by position would give a window another window's frame.
+  - Stored frames whose window no longer exists are logged and skipped; live windows with no stored frame are left alone.
+  - For each paired window, constructs AXValue instances for position and size and sets kAXPositionAttribute and kAXSizeAttribute.
 
 - axWinList(pid):
   - Creates an AXUIElement for the app and queries kAXWindowsAttribute.
-  - Filters out non-window elements (for example Finder scroll areas) by checking kAXRoleAttribute equals kAXWindowRole.
+  - Keeps AXWindow elements, resolves non-window elements (for example Finder scroll areas) to their containing window, and drops duplicates.
+  - Resolves each element's window number with _AXUIElementGetWindow (private HIServices API); elements without one are dropped.
 
 These functions rely on the system having granted Accessibility permissions to Memmon; without that, AXUIElement calls will silently fail.
 

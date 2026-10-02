@@ -44,9 +44,16 @@ ifeq ($(HAS_SIGN_IDENTITY),1)
 endif
 
 
+.PHONY: test
+test: SDK_PATH=$(shell xcrun --show-sdk-path --sdk macosx)
+test:
+	swiftc -Onone src/main.swift -emit-executable -sdk ${SDK_PATH} -o bin_selftest
+	./bin_selftest --self-test; s=$$?; rm -f bin_selftest; exit $$s
+
+
 .PHONY: clean
 clean:
-	rm -rf Memmon.app bin_x64 bin_arm64
+	rm -rf Memmon.app bin_x64 bin_arm64 bin_selftest
 
 
 .PHONY: release

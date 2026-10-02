@@ -12,6 +12,60 @@ typealias DisplaySig = String
 
 typealias SpaceId = WinNum // see NSWindow.windowNumber (Int)
 
+// The window number (CGWindowID) behind an AX window element. Private, but long-stable HIServices API.
+@_silgen_name("_AXUIElementGetWindow")
+func _AXUIElementGetWindow(_ element: AXUIElement, _ wid: UnsafeMutablePointer<CGWindowID>) -> AXError
+
+/// Pair saved window frames with the live windows of the same app, by window number.
+/// List position is never used: both lists are in z-order, which changes with every click.
+/// Returns the frames to apply, plus the saved window numbers that have no live window.
+func pairSavedFrames<W>(_ saved: [WinPos], _ live: [(WinNum, W)]) -> (matched: [(W, CGRect)], unmatched: [WinNum]) {
+	var matched: [(W, CGRect)] = []
+	var unmatched: [WinNum] = []
+	for (winNum, rect) in saved {
+		if rect.isEmpty { continue } // filter dummy elements
+		if let win = live.first(where: { $0.0 == winNum }) {
+			matched.append((win.1, rect))
+		} else {
+			unmatched.append(winNum)
+		}
+	}
+	return (matched, unmatched)
+}
+
+// MARK: - Self Test (make test)
+func runSelfTest() -> Bool {
+	var failures = 0
+	func check(_ name: String, _ got: (matched: [(String, CGRect)], unmatched: [WinNum]), _ want: [String: CGRect], _ wantUnmatched: [WinNum]) {
+		var gotMap: [String: CGRect] = [:]
+		for (w, r) in got.matched { gotMap[w] = r }
+		let ok = gotMap == want && got.matched.count == want.count && got.unmatched == wantUnmatched
+		if !ok { failures += 1 }
+		print("\(ok ? "ok  " : "FAIL") \(name)" + (ok ? "" : ": matched=\(got.matched) unmatched=\(got.unmatched)"))
+	}
+	let small = CGRect(x: -967, y: -2159, width: 727, height: 152)
+	let big = CGRect(x: 206, y: 39, width: 1557, height: 1204)
+	let mid = CGRect(x: 110, y: 411, width: 1150, height: 832)
+	let saved: [WinPos] = [(168, small), (170, big), (174, mid)]
+
+	check("same order", pairSavedFrames(saved, [(168, "a"), (170, "b"), (174, "c")]),
+		  ["a": small, "b": big, "c": mid], [])
+	// A window was clicked since the save, so the live list is in a different z-order.
+	check("live windows reordered", pairSavedFrames(saved, [(174, "c"), (168, "a"), (170, "b")]),
+		  ["a": small, "b": big, "c": mid], [])
+	check("new live window is left alone", pairSavedFrames(saved, [(900, "new"), (168, "a"), (170, "b"), (174, "c")]),
+		  ["a": small, "b": big, "c": mid], [])
+	check("closed window is reported, others keep their own frame", pairSavedFrames(saved, [(174, "c"), (170, "b")]),
+		  ["b": big, "c": mid], [168])
+	check("dummy frames are skipped", pairSavedFrames([(168, CGRect.zero), (170, big)], [(170, "b"), (168, "a")]),
+		  ["b": big], [])
+	check("live window listed twice is set once", pairSavedFrames(saved, [(168, "a"), (168, "a2"), (170, "b"), (174, "c")]),
+		  ["a": small, "b": big, "c": mid], [])
+	check("no live windows", pairSavedFrames(saved, [(WinNum, String)]()), [:], [168, 170, 174])
+	print(failures == 0 ? "self-test passed" : "self-test FAILED (\(failures))")
+	return failures == 0
+}
+
 @available(macOS 10.12, *)
 class AppDelegate: NSObject, NSApplicationDelegate {
 	private var statusItem: NSStatusItem!
@@ -661,39 +715,40 @@ menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
 		guard sizes.count > 0 else { return }
 		let win = self.axWinList(pid)
 
-		// Handle window count mismatch: apply saved positions to all available windows
-		if win.count != sizes.count {
-			if win.count == 0 {
-				// AX reports no windows (may be minimized or not yet visible)
-				log("AX window count mismatch for pid=\(pid): ax=0 saved=\(sizes.count) (windows not accessible, skipping)")
-				return
-			}
-			log("AX window count mismatch for pid=\(pid): ax=\(win.count) saved=\(sizes.count) (applying to min=\(min(win.count, sizes.count)))")
+		if win.count == 0 {
+			// AX reports no windows (may be minimized or not yet visible)
+			log("AX window mismatch for pid=\(pid): ax=0 saved=\(sizes.count) (windows not accessible, skipping)")
+			return
 		}
 
-		// Restore positions for all windows we have both AX and saved data for
-		let count = min(win.count, sizes.count)
-		for i in 0 ..< count {
-			var rect = sizes[i].1
-			if rect.isEmpty { continue } // filter dummy elements
+		// Each saved frame goes to the window it was saved from; windows without a saved frame are left alone.
+		let (matched, unmatched) = pairSavedFrames(sizes, win)
+		if !unmatched.isEmpty {
+			log("AX window mismatch for pid=\(pid): ax=\(win.count) saved=\(sizes.count) matched=\(matched.count) (no AX window for saved winNums=\(unmatched), skipping those)")
+		}
+		for (el, frame) in matched {
+			var rect = frame
 			let origin = AXValueCreate(AXValueType(rawValue: kAXValueCGPointType)!, &rect.origin)!
 			let size = AXValueCreate(AXValueType(rawValue: kAXValueCGSizeType)!, &rect.size)!
-			AXUIElementSetAttributeValue(win[i], kAXPositionAttribute as CFString, origin)
-			AXUIElementSetAttributeValue(win[i], kAXSizeAttribute as CFString, size)
+			AXUIElementSetAttributeValue(el, kAXPositionAttribute as CFString, origin)
+			AXUIElementSetAttributeValue(el, kAXSizeAttribute as CFString, size)
 		}
 	}
 
-	private func axWinList(_ pid: pid_t) -> [AXUIElement] {
+	private func axWinList(_ pid: pid_t) -> [(WinNum, AXUIElement)] {
 		let appRef = AXUIElementCreateApplication(pid)
 		var value: CFTypeRef?
 		AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &value)
 		guard let windowList = value as? [AXUIElement] else { return [] }
-		var tmp: [AXUIElement] = []
+		var tmp: [(WinNum, AXUIElement)] = []
 		// Some apps (notably Finder) can expose non-window elements (e.g., AXScrollArea) in the windows list.
 		// If we encounter a scroll area, resolve its containing AXWindow via kAXWindowAttribute.
+		// Elements whose window number cannot be resolved are dropped: without it they cannot be matched.
 		func appendUnique(_ el: AXUIElement) {
-			if !tmp.contains(where: { $0 as CFTypeRef === el as CFTypeRef }) {
-				tmp.append(el)
+			var wid: CGWindowID = 0
+			guard _AXUIElementGetWindow(el, &wid) == .success, wid != 0 else { return }
+			if !tmp.contains(where: { $0.0 == WinNum(wid) }) {
+				tmp.append((WinNum(wid), el))
 			}
 		}
 		for el in windowList {
@@ -799,6 +854,9 @@ extension NSImage {
 }
 
 // MARK: - Main Entry
+if CommandLine.arguments.contains("--self-test") {
+	exit(runSelfTest() ? 0 : 1)
+}
 if #available(macOS 10.12, *) {
     let delegate = AppDelegate()
     NSApplication.shared.delegate = delegate
