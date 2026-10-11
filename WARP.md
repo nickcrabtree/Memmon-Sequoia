@@ -233,12 +233,15 @@ Commit first, so the build number is right, then:
 - Any change: one restore runs 1.6 s after the last change in a burst. The later retries (8, 20, 40, 70 s) log "Restore skipped ... layout not dirty" because the first attempt clears the layoutDirty flag.
 - 75 s after the last change, the current positions are saved as the layout of the current signature ("Deferred auto save after settle").
 - Wake from sleep schedules a restore only if the signature differs from the one before sleep.
+- Screen locked (screensaver or lock screen, tracked via the com.apple.screenIsLocked/Unlocked distributed notifications): an automatic restore logs "Restore deferred ... screen locked" and leaves layoutDirty set; the settle save logs "Deferred auto save postponed". On unlock, "Screen unlocked: ... action=restore" schedules a fresh restore (with its own settle save), or "action=save" runs the postponed save. While locked the Accessibility API exposes no windows and frames set do not stick, which is why both wait.
+- Closing the lid with external displays and power connected is not sleep: the laptop display is removed (3 to 2) and re-added on reopen. Only the screen-change path runs; there are no "Will sleep" or "Did wake" lines.
 
 ### Reading the log
 
 - Signatures span several lines, one display per line; continuation lines start with a display UUID. Filter them out with rg -v '^[0-9A-F]{8}-' to get one line per event.
-- "Restore attempt (...) hasLayout=true": frames were applied. With "matchSig=", the layout was borrowed and translated.
-- "AX window mismatch for pid=N: ax=0 ...": the app exposed no windows to the Accessibility API, so none of its windows were restored. Aquamacs does this consistently.
+- "Restore attempt (...) hasLayout=true locked=false": frames were applied. With "matchSig=", the layout was borrowed and translated.
+- Each applied frame gets its own line: "  <app> win=<N> -> (x,y WxH) ok", or "... FAILED position=<AXError> size=<AXError> readback=(...)" when a set call returned an error. A third form, "... set ok but readback=(...)", means both set calls succeeded but the window reports a frame more than a point off: apps that snap to a grid (Terminal) or move asynchronously (Electron, Java), or macOS keeping the window on screen. "Restore done: apps=N moved=.. differs=.. failed=.. skipped=.." sums them.
+- "AX window mismatch for pid=N (<app>): ax=0 ...": the app exposed no windows to the Accessibility API, so none of its windows were restored. Aquamacs does this consistently; every app does it while the screen is locked.
 - "AX window mismatch ... (no AX window for saved winNums=[...])": those saved windows have gone (closed, or not exposed); the rest were restored.
 - ps -p <pid> -o comm= names the app behind a pid.
 
@@ -257,7 +260,7 @@ Plugging and unplugging pass through the two-display sets for a few seconds, bec
 ### Known limitations
 
 - A snapshot taken while the Mac is passing through an intermediate display set becomes that set's layout when the next display is removed. A later real session on that set starts from those transit positions.
-- Only the first restore after a change does anything, so an app whose windows are not accessible at that moment is not retried.
+- Only the first restore after a change does anything, so an app whose windows are not accessible at that moment is not retried. (A restore blocked by the screen lock is the exception: it is re-run on unlock.)
 - Apps that expose no AX windows (Aquamacs) are never restored.
 - _AXUIElementGetWindow is private API. If it ever stops resolving window numbers, axWinList returns nothing and every app logs "ax=0".
 - "Displays have separate Spaces" is off on this Mac (separateSpaces=false), so restoreLayoutAllAtOnce is the path in use; the per-space path (restoreState) is not exercised here.

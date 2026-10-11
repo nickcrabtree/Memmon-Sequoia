@@ -33,6 +33,53 @@ func pairSavedFrames<W>(_ saved: [WinPos], _ live: [(WinNum, W)]) -> (matched: [
 	return (matched, unmatched)
 }
 
+// MARK: - Screen lock
+// While the screensaver or lock screen is up, the Accessibility API exposes no windows and frames set
+// then do not stick (2026-10-11: a lid reopen restored 2 s after wake, against the lock screen, and the
+// deferred save then stored the unrestored positions). Restores and the deferred save wait for the unlock.
+
+enum RestoreGate { case proceed, waitForUnlock }
+enum UnlockAction { case restore, save, none }
+
+/// Whether an automatic restore may run now. A manual restore comes from the menu, so the screen is unlocked.
+func restoreGate(screenLocked: Bool, manual: Bool) -> RestoreGate {
+	return (screenLocked && !manual) ? .waitForUnlock : .proceed
+}
+
+/// What to run once the screen unlocks: a restore (which schedules its own save after settle) if one is
+/// still owed, else a save that was postponed by the lock, else nothing.
+func unlockFollowUp(layoutDirty: Bool, savePending: Bool) -> UnlockAction {
+	if layoutDirty { return .restore }
+	if savePending { return .save }
+	return .none
+}
+
+func axErrorName(_ err: AXError) -> String {
+	switch err {
+	case .success: return "success"
+	case .failure: return "failure"
+	case .illegalArgument: return "illegalArgument"
+	case .invalidUIElement: return "invalidUIElement"
+	case .invalidUIElementObserver: return "invalidUIElementObserver"
+	case .cannotComplete: return "cannotComplete"
+	case .attributeUnsupported: return "attributeUnsupported"
+	case .actionUnsupported: return "actionUnsupported"
+	case .notificationUnsupported: return "notificationUnsupported"
+	case .notImplemented: return "notImplemented"
+	case .notificationAlreadyRegistered: return "notificationAlreadyRegistered"
+	case .notificationNotRegistered: return "notificationNotRegistered"
+	case .apiDisabled: return "apiDisabled"
+	case .noValue: return "noValue"
+	case .parameterizedAttributeUnsupported: return "parameterizedAttributeUnsupported"
+	case .notEnoughPrecision: return "notEnoughPrecision"
+	@unknown default: return "AXError(\(err.rawValue))"
+	}
+}
+
+func fmt(_ r: CGRect) -> String {
+	return "(\(Int(r.origin.x)),\(Int(r.origin.y)) \(Int(r.width))x\(Int(r.height)))"
+}
+
 // MARK: - Layouts across display configurations
 // Window frames are saved in global coordinates, so a layout only fits the display arrangement it was
 // saved under. macOS keeps a separate arrangement for every set of connected displays, so the same
@@ -202,6 +249,17 @@ func runSelfTest() -> Bool {
 	expect("among equals, borrow the most recently saved", bestLayoutSource(for: lab, among: [(labOld, t0), (labSwapped, t1)]), labSwapped)
 	expect("nothing to borrow", bestLayoutSource(for: lab, among: [(la, t1), (l, t1)]), nil)
 
+	// Screen lock gate: nothing is restored or saved while the screensaver or lock screen is up.
+	expect("locked: restore waits", restoreGate(screenLocked: true, manual: false), RestoreGate.waitForUnlock)
+	expect("unlocked: restore runs", restoreGate(screenLocked: false, manual: false), RestoreGate.proceed)
+	expect("manual restore is never gated", restoreGate(screenLocked: true, manual: true), RestoreGate.proceed)
+	expect("unlock with a pending restore restores (and saves after settle)", unlockFollowUp(layoutDirty: true, savePending: true), UnlockAction.restore)
+	expect("unlock with a pending restore but no save still restores", unlockFollowUp(layoutDirty: true, savePending: false), UnlockAction.restore)
+	expect("unlock with only a pending save saves", unlockFollowUp(layoutDirty: false, savePending: true), UnlockAction.save)
+	expect("unlock with nothing pending does nothing", unlockFollowUp(layoutDirty: false, savePending: false), UnlockAction.none)
+	expect("AX error names", axErrorName(.cannotComplete), "cannotComplete")
+	expect("AX success name", axErrorName(.success), "success")
+
 	print(failures == 0 ? "self-test passed" : "self-test FAILED (\(failures))")
 	return failures == 0
 }
@@ -219,6 +277,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 	// Dirty flag: only restore if display configuration actually changed
 	private var layoutDirty: Bool = false
+
+	// Screen lock (see restoreGate). screenLocked mirrors the com.apple.screenIsLocked/Unlocked notifications;
+	// deferredSavePending records a settle save that the lock postponed.
+	private var screenLocked: Bool = false
+	private var deferredSavePending: Bool = false
 
 	// Debounced restore
 	private var restoreDebounce: DispatchWorkItem?
@@ -346,6 +409,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 		wsnc.addObserver(self, selector: #selector(self.willSleep(_:)), name: NSWorkspace.willSleepNotification, object: nil)
 		wsnc.addObserver(self, selector: #selector(self.didWake(_:)), name: NSWorkspace.didWakeNotification, object: nil)
 		wsnc.addObserver(self, selector: #selector(self.screensDidWake(_:)), name: NSWorkspace.screensDidWakeNotification, object: nil)
+
+		// Track screen lock / unlock. deliverImmediately: a background-only app is never active, and the default
+		// suspension behaviour can hold distributed notifications back from an inactive app.
+		let dnc = DistributedNotificationCenter.default()
+		dnc.addObserver(self, selector: #selector(self.screenDidLock(_:)), name: Notification.Name("com.apple.screenIsLocked"), object: nil, suspensionBehavior: .deliverImmediately)
+		dnc.addObserver(self, selector: #selector(self.screenDidUnlock(_:)), name: Notification.Name("com.apple.screenIsUnlocked"), object: nil, suspensionBehavior: .deliverImmediately)
+		self.screenLocked = self.sessionScreenLocked()
+		log("Screen lock state at launch: locked=\(self.screenLocked)")
 
 		_ = self.currentSpace() // create space-id win for current space
 		self.spacesVisited = Set(self.getWinIds())
@@ -475,7 +546,7 @@ menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
 		let wakeSig = self.displaySignature()
 		let wakeCount = NSScreen.screens.count
 		if wakeSig != self.currentSig || wakeCount != self.numScreens {
-			log("Did wake: display config changed (old=\(self.numScreens) new=\(wakeCount)), scheduling restore")
+			log("Did wake: display config changed (old=\(self.numScreens) new=\(wakeCount)) locked=\(self.screenLocked), scheduling restore")
 			self.layoutDirty = true
 			self.scheduleRestoreDebounced(reason: "didWake")
 		} else {
@@ -488,7 +559,7 @@ menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
 		let wakeSig = self.displaySignature()
 		let wakeCount = NSScreen.screens.count
 		if wakeSig != self.currentSig || wakeCount != self.numScreens {
-			log("Screens did wake: display config changed (old=\(self.numScreens) new=\(wakeCount)), scheduling restore")
+			log("Screens did wake: display config changed (old=\(self.numScreens) new=\(wakeCount)) locked=\(self.screenLocked), scheduling restore")
 			// Diagnostics: wallpaper may take a while to appear after wake; probe readiness.
 			if wakeCount > 1 {
 				self.externalsDetectedAt = Date()
@@ -498,6 +569,34 @@ menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
 			self.scheduleRestoreDebounced(reason: "screensDidWake")
 		} else {
 			log("Screens did wake: display config unchanged, skipping restore")
+		}
+	}
+
+	/// The session's lock state as the window server reports it (used once, at launch; after that the notifications keep screenLocked current).
+	private func sessionScreenLocked() -> Bool {
+		guard let dict = CGSessionCopyCurrentDictionary() as? [String: Any] else { return false }
+		return (dict["CGSSessionScreenIsLocked"] as? Bool) ?? false
+	}
+
+	@objc private func screenDidLock(_ note: Notification) {
+		self.screenLocked = true
+		log("Screen locked: layoutDirty=\(self.layoutDirty) savePending=\(self.deferredSavePending)")
+	}
+
+	@objc private func screenDidUnlock(_ note: Notification) {
+		self.screenLocked = false
+		let action = unlockFollowUp(layoutDirty: self.layoutDirty, savePending: self.deferredSavePending)
+		log("Screen unlocked: layoutDirty=\(self.layoutDirty) savePending=\(self.deferredSavePending) action=\(action)")
+		switch action {
+		case .restore:
+			self.scheduleRestoreDebounced(reason: "screen-unlocked")
+		case .save:
+			self.deferredSavePending = false
+			let sig = self.displaySignature()
+			self.saveState(for: sig)
+			log("Postponed auto save done after unlock: sig=\(sig)")
+		case .none:
+			break
 		}
 	}
 
@@ -519,9 +618,16 @@ menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
 		DispatchQueue.main.asyncAfter(deadline: .now() + self.settleDeferredSaveDelay) { [weak self] in
 			guard let self else { return }
 			guard self.screenChangeSeq == seq else { return }
+			if self.screenLocked {
+				// Windows may still be where macOS dumped them; saving now would make that the layout.
+				self.deferredSavePending = true
+				self.log("Deferred auto save postponed: screen locked (layoutDirty=\(self.layoutDirty))")
+				return
+			}
+			self.deferredSavePending = false
 			let sig = self.displaySignature()
 			self.saveState(for: sig)
-			self.log("Deferred auto save after settle: sig=\(sig)")
+			self.log("Deferred auto save after settle: sig=\(sig) layoutDirty=\(self.layoutDirty)")
 		}
 	}
 
@@ -772,6 +878,11 @@ menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
 			log("Restore skipped (\(reason)): layout not dirty, no display change detected")
 			return
 		}
+		if restoreGate(screenLocked: self.screenLocked, manual: reason.starts(with: "manual")) == .waitForUnlock {
+			// Keep layoutDirty so the unlock handler runs the restore.
+			log("Restore deferred (\(reason)): screen locked; will restore on unlock")
+			return
+		}
 
 		let sig = self.displaySignature()
 		self.currentSig = sig
@@ -793,7 +904,7 @@ menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
 			self.state[sig] = moved
 			log("No exact layout for sig; using best-match layout from sig=\(match), moved to the current display positions")
 		}
-		log("Restore attempt (\(reason)): screens=\(NSScreen.screens.count) sig=\(sig) hasLayout=\(layout != nil) axTrusted=\(axTrusted) separateSpaces=\(self.separateSpaces)" + (usedSig == sig ? "" : " matchSig=\(usedSig)"))
+		log("Restore attempt (\(reason)): screens=\(NSScreen.screens.count) sig=\(sig) hasLayout=\(layout != nil) axTrusted=\(axTrusted) locked=\(self.screenLocked) separateSpaces=\(self.separateSpaces)" + (usedSig == sig ? "" : " matchSig=\(usedSig)"))
 		guard let layout else {
 			// No layout to restore, clear dirty flag
 			self.layoutDirty = false
@@ -817,9 +928,25 @@ menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
 	private func restoreLayoutAllAtOnce(_ layout: WinConf) {
 		let visibleWinNums = self.getWinIds()
 		self.spacesVisited.formUnion(visibleWinNums)
+		var total = AXSetResult()
 		for (pid, bounds) in layout {
-			self.setWindowSizes(pid, bounds.filter { visibleWinNums.contains($0.0) })
+			total.add(self.setWindowSizes(pid, bounds.filter { visibleWinNums.contains($0.0) }))
 		}
+		log("Restore done: apps=\(layout.count) \(total)")
+	}
+
+	/// Outcome of applying saved frames: moved = both set calls succeeded and the frame read back as asked;
+	/// differs = set calls succeeded but the frame read back more than a point off (apps that snap to a grid or
+	/// apply moves asynchronously, or macOS keeping the window on screen); failed = a set call returned an error;
+	/// skipped = saved frames with no AX window.
+	struct AXSetResult: CustomStringConvertible {
+		var moved = 0, differs = 0, failed = 0, skipped = 0
+		mutating func add(_ o: AXSetResult) { moved += o.moved; differs += o.differs; failed += o.failed; skipped += o.skipped }
+		var description: String { "moved=\(moved) differs=\(differs) failed=\(failed) skipped=\(skipped)" }
+	}
+
+	private func appName(_ pid: pid_t) -> String {
+		return NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid\(pid)"
 	}
 
 	private func restoreState(_ layout: WinConf) {
@@ -838,28 +965,61 @@ menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
 		}
 	}
 
-	private func setWindowSizes(_ pid: pid_t, _ sizes: [WinPos]) {
-		guard sizes.count > 0 else { return }
+	@discardableResult
+	private func setWindowSizes(_ pid: pid_t, _ sizes: [WinPos]) -> AXSetResult {
+		var result = AXSetResult()
+		guard sizes.count > 0 else { return result }
 		let win = self.axWinList(pid)
+		let name = self.appName(pid)
 
 		if win.count == 0 {
-			// AX reports no windows (may be minimized or not yet visible)
-			log("AX window mismatch for pid=\(pid): ax=0 saved=\(sizes.count) (windows not accessible, skipping)")
-			return
+			// AX reports no windows (may be minimized, not yet visible, or the screen is locked)
+			log("AX window mismatch for pid=\(pid) (\(name)): ax=0 saved=\(sizes.count) (windows not accessible, skipping)")
+			result.skipped = sizes.count
+			return result
 		}
 
 		// Each saved frame goes to the window it was saved from; windows without a saved frame are left alone.
-		let (matched, unmatched) = pairSavedFrames(sizes, win)
+		let (matched, unmatched) = pairSavedFrames(sizes, win.map { ($0.0, $0) })
 		if !unmatched.isEmpty {
-			log("AX window mismatch for pid=\(pid): ax=\(win.count) saved=\(sizes.count) matched=\(matched.count) (no AX window for saved winNums=\(unmatched), skipping those)")
+			log("AX window mismatch for pid=\(pid) (\(name)): ax=\(win.count) saved=\(sizes.count) matched=\(matched.count) (no AX window for saved winNums=\(unmatched), skipping those)")
+			result.skipped = unmatched.count
 		}
-		for (el, frame) in matched {
+		for ((winNum, el), frame) in matched {
 			var rect = frame
 			let origin = AXValueCreate(AXValueType(rawValue: kAXValueCGPointType)!, &rect.origin)!
 			let size = AXValueCreate(AXValueType(rawValue: kAXValueCGSizeType)!, &rect.size)!
-			AXUIElementSetAttributeValue(el, kAXPositionAttribute as CFString, origin)
-			AXUIElementSetAttributeValue(el, kAXSizeAttribute as CFString, size)
+			let posErr = AXUIElementSetAttributeValue(el, kAXPositionAttribute as CFString, origin)
+			let sizeErr = AXUIElementSetAttributeValue(el, kAXSizeAttribute as CFString, size)
+			let got = self.axFrame(el)
+			let stuck = got.map { abs($0.origin.x - frame.origin.x) <= 1 && abs($0.origin.y - frame.origin.y) <= 1
+				&& abs($0.width - frame.width) <= 1 && abs($0.height - frame.height) <= 1 } ?? false
+			let readback = got.map(fmt) ?? "none"
+			if posErr != .success || sizeErr != .success {
+				result.failed += 1
+				log("  \(name) win=\(winNum) -> \(fmt(frame)) FAILED position=\(axErrorName(posErr)) size=\(axErrorName(sizeErr)) readback=\(readback)")
+			} else if stuck {
+				result.moved += 1
+				log("  \(name) win=\(winNum) -> \(fmt(frame)) ok")
+			} else {
+				result.differs += 1
+				log("  \(name) win=\(winNum) -> \(fmt(frame)) set ok but readback=\(readback)")
+			}
 		}
+		return result
+	}
+
+	/// The window's frame as the Accessibility API reports it now (nil if it cannot be read).
+	private func axFrame(_ el: AXUIElement) -> CGRect? {
+		var posRef: CFTypeRef?, sizeRef: CFTypeRef?
+		guard AXUIElementCopyAttributeValue(el, kAXPositionAttribute as CFString, &posRef) == .success,
+			  AXUIElementCopyAttributeValue(el, kAXSizeAttribute as CFString, &sizeRef) == .success,
+			  let posRef, let sizeRef,
+			  CFGetTypeID(posRef) == AXValueGetTypeID(), CFGetTypeID(sizeRef) == AXValueGetTypeID() else { return nil }
+		var p = CGPoint.zero, sz = CGSize.zero
+		guard AXValueGetValue(posRef as! AXValue, AXValueType(rawValue: kAXValueCGPointType)!, &p),
+			  AXValueGetValue(sizeRef as! AXValue, AXValueType(rawValue: kAXValueCGSizeType)!, &sz) else { return nil }
+		return CGRect(origin: p, size: sz)
 	}
 
 	private func axWinList(_ pid: pid_t) -> [(WinNum, AXUIElement)] {
