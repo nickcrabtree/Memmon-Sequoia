@@ -228,7 +228,7 @@ Commit first, so the build number is right, then:
 
 ### What happens on a display change
 
-- Every 2 s a timer snapshots all window frames under the current signature (lastStableState).
+- Every 2 s a timer snapshots all window frames under the current signature (lastStableState). A snapshot with a window that touches no display of the current signature is rejected ("Snapshot rejected ..."), because it caught a display change in progress: the window server moves windows to the next arrangement before NSScreen reports it, and keeping such a snapshot would make those shifted frames the layout (2026-10-11: four Terminal windows restored a monitor-width away after a lid reopen).
 - Displays removed: the last snapshot becomes the layout of the configuration that just went away ("Preserved last stable snapshot").
 - Any change: one restore runs 1.6 s after the last change in a burst. The later retries (8, 20, 40, 70 s) log "Restore skipped ... layout not dirty" because the first attempt clears the layoutDirty flag.
 - 75 s after the last change, the current positions are saved as the layout of the current signature ("Deferred auto save after settle").
@@ -261,6 +261,7 @@ Plugging and unplugging pass through the two-display sets for a few seconds, bec
 
 - A snapshot taken while the Mac is passing through an intermediate display set becomes that set's layout when the next display is removed. A later real session on that set starts from those transit positions.
 - Only the first restore after a change does anything, so an app whose windows are not accessible at that moment is not retried. (A restore blocked by the screen lock is the exception: it is re-run on unlock.)
+- The mid-transition snapshot check only sees windows that end up off every display of the old signature. A transition whose shifted windows all land inside some display region is not caught and that snapshot becomes the layout.
 - Apps that expose no AX windows (Aquamacs) are never restored.
 - _AXUIElementGetWindow is private API. If it ever stops resolving window numbers, axWinList returns nothing and every app logs "ax=0".
 - "Displays have separate Spaces" is off on this Mac (separateSpaces=false), so restoreLayoutAllAtOnce is the path in use; the per-space path (restoreState) is not exercised here.

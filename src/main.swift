@@ -100,6 +100,31 @@ func sigDisplays(_ sig: DisplaySig) -> [DisplayFrame] {
 	return out
 }
 
+/// Windows of a snapshot whose frame touches no display of the signature it was taken under. macOS keeps every
+/// window at least partly on a display, so such frames mean the snapshot caught a display change in progress:
+/// the window server had already moved some windows to the next arrangement's coordinates (2026-10-11: four
+/// Terminal windows, shifted by the left monitor's origin change) before NSScreen reported the new displays.
+/// A window that was already off every display in the baseline (the last accepted snapshot of the same signature)
+/// is not evidence: some apps park a helper window far off-screen for good, and counting it would reject every
+/// snapshot from then on. With no baseline every off-screen window counts.
+func windowsOffDisplays(_ snap: WinConf, _ displays: [DisplayFrame], baseline: WinConf? = nil) -> [WinNum] {
+	func onDisplay(_ rect: CGRect) -> Bool { displays.contains(where: { $0.bounds.intersects(rect) }) }
+	var wasOn: Set<WinNum>? = nil
+	if let baseline {
+		wasOn = Set(baseline.values.joined().filter { !$0.1.isEmpty && onDisplay($0.1) }.map { $0.0 })
+	}
+	var off: [WinNum] = []
+	for (_, wins) in snap {
+		for (winNum, rect) in wins {
+			if rect.isEmpty { continue } // placeholder
+			if onDisplay(rect) { continue }
+			if let wasOn, !wasOn.contains(winNum) { continue }
+			off.append(winNum)
+		}
+	}
+	return off
+}
+
 /// Pair every display of a saved configuration with a display of the current one.
 /// nil unless each display finds a partner of its own size.
 func mapDisplays(_ saved: [DisplayFrame], _ current: [DisplayFrame]) -> [(from: DisplayFrame, to: DisplayFrame)]? {
@@ -260,6 +285,21 @@ func runSelfTest() -> Bool {
 	expect("AX error names", axErrorName(.cannotComplete), "cannotComplete")
 	expect("AX success name", axErrorName(.success), "success")
 
+	// A snapshot taken while macOS is moving windows for a display change must not become a layout.
+	let threeDisplays = sigDisplays(lab)
+	let onLeft: WinConf = [1: [(71, CGRect(x: 2948, y: -2078, width: 1941, height: 1969))]]
+	let shifted: WinConf = [1: [(71, CGRect(x: 3923, y: 82, width: 1941, height: 1969)), (69, CGRect(x: 5916, y: 307, width: 1701, height: 1561))],
+						  2: [(132, CGRect(x: 3482, y: -1460, width: 1250, height: 850))]]
+	let hangingOff: WinConf = [1: [(8006, CGRect(x: 1567, y: 201, width: 1765, height: 1920))]]
+	expect("snapshot on the displays fits", windowsOffDisplays(onLeft, threeDisplays), [])
+	expect("mid-transition frames are off every display", windowsOffDisplays(shifted, threeDisplays).sorted(), [69, 71])
+	expect("a window hanging off the edge still fits", windowsOffDisplays(hangingOff, threeDisplays), [])
+	expect("empty placeholder frames are ignored", windowsOffDisplays([1: [(5, CGRect.zero)]], threeDisplays), [])
+	let parked: WinConf = [3: [(900, CGRect(x: -20000, y: -20000, width: 300, height: 200))]]
+	expect("a window parked off-screen in the baseline too is not transition evidence", windowsOffDisplays(parked, threeDisplays, baseline: parked), [])
+	expect("only a window that was on a display in the baseline counts; one absent from it does not", windowsOffDisplays(shifted, threeDisplays, baseline: onLeft), [71])
+	expect("with no baseline every off-screen window counts", windowsOffDisplays(parked, threeDisplays, baseline: nil), [900])
+
 	print(failures == 0 ? "self-test passed" : "self-test FAILED (\(failures))")
 	return failures == 0
 }
@@ -301,6 +341,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 	// Last stable snapshot (captured periodically) to prevent overwriting good layouts on unplug.
 	private var lastStableSig: DisplaySig = ""
 	private var lastStableState: WinConf = [:]
+	private var snapshotRejects: Int = 0 // consecutive snapshots rejected as mid-transition
+	private var lastStableAt: Date = Date.distantPast
 	private var snapshotTimer: Timer?
 
 	// Diagnostics
@@ -426,9 +468,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 			guard let self else { return }
 			let sig = self.displaySignature()
 			let snap = self.getState()
-			if !snap.isEmpty {
+			guard !snap.isEmpty else { return }
+			let baseline = self.lastStableSig == sig ? self.lastStableState : nil
+			let off = windowsOffDisplays(snap, sigDisplays(sig), baseline: baseline)
+			if off.isEmpty {
 				self.lastStableSig = sig
 				self.lastStableState = snap
+				self.lastStableAt = Date()
+				self.snapshotRejects = 0
+			} else {
+				// Display change in progress: keep the previous good snapshot. Log the first rejection of a run only.
+				self.snapshotRejects += 1
+				if self.snapshotRejects == 1 || self.snapshotRejects % 10 == 0 {
+					self.log("Snapshot rejected (\(self.snapshotRejects) in a row): windows off every display of the current signature winNums=\(off) (keeping snapshot from \(self.logDF.string(from: self.lastStableAt)))")
+				}
 			}
 		}
 		if let t = self.snapshotTimer {

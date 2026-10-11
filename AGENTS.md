@@ -62,6 +62,15 @@ close and reopen case has not yet been exercised with the new build; the first r
 should be checked in the log for "Restore deferred", "Screen unlocked ... action=restore"
 and the per-window "ok" lines.
 
+Second finding, same day, from the first locked lid cycle on the new build: the lock gate worked
+(deferred, then restored on unlock, 17 frames applied), but four Terminal windows went to the
+wrong place. Their target frames were the good ones shifted by exactly the left monitor's origin
+change between arrangements, so the 2 s snapshot preserved at lid close had been taken
+mid-transition, after the window server moved Terminal's windows but before NSScreen reported
+the display change. Fixed by rejecting any snapshot with a window off every display of its
+signature (`windowsOffDisplays`, self-tested). The "set ok but readback=" log form is what
+exposed this: the set calls succeeded and macOS clamped the frames to the menu bar.
+
 ## Comparison case that worked
 
 On 2026-10-11 at 09:13 a reopen produced a second screen-parameters change 3 s after the
