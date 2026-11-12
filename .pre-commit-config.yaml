@@ -1,0 +1,43 @@
+# Pre-commit configuration, in the ~/scripts family: generic hygiene hooks plus Swift checks.
+# Run on staged files only, never --all-files (AGENT_POLICY). Hooks are not installed into .git/hooks,
+# as in the other repos: run `pre-commit run` before committing.
+#
+# Swift: `swiftc -parse` (syntax) and Apple's swift-format from the Xcode toolchain in --strict lint mode
+# (Nick, 2026-11-12). Existing Swift files carry swift-format debt; per policy it is fixed in each file the
+# next time that file is touched, not by a repo-wide reformat.
+
+minimum_pre_commit_version: "3.0.0"
+
+default_stages: [pre-commit]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-yaml
+      - id: check-json
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  - repo: local
+    hooks:
+      - id: bash-syntax
+        name: Bash syntax (bash -n)
+        entry: bash -n
+        language: system
+        types: [shell]
+      - id: swift-syntax
+        name: Swift syntax (swiftc -parse)
+        entry: xcrun swiftc -parse
+        language: system
+        files: \.swift$
+      - id: swift-format-lint
+        name: Swift format and lint (swift-format lint --strict)
+        entry: xcrun swift-format lint --strict
+        language: system
+        files: \.swift$
