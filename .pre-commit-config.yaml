@@ -33,7 +33,8 @@ repos:
         types: [shell]
       - id: swift-syntax
         name: Swift syntax (swiftc -parse)
-        entry: xcrun swiftc -parse
+        # One file per swiftc call: given several files, swiftc allows top-level code in none of them.
+        entry: bash -c 'for f in "$@"; do xcrun swiftc -parse "$f" || exit 1; done' --
         language: system
         files: \.swift$
       - id: swift-format-lint
